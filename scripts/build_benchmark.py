@@ -36,9 +36,15 @@ from typing import Any, Dict, List
 
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts/ modules
+
+import benchmark_protocol as protocol  # noqa: E402  (needs the sys.path insert above)
 
 # ---- SEALED SEED — never change after first build ----
-_BENCHMARK_SEED: int = 271828182  # first 9 digits of e — arbitrary but fixed forever
+# The sampling protocol (seed, split counts, integrity hash) is frozen in
+# scripts/benchmark_protocol.py; see docs/BENCHMARK_PROTOCOL.md. Kept as a local
+# alias so the build log and file headers keep printing the seed.
+_BENCHMARK_SEED: int = protocol.SEALED_SEED
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -64,15 +70,11 @@ def _encrypt_json(data: dict, password: str) -> str:
     return base64.b64encode(combined).decode("ascii")
 
 
-def _load_tasks(benchmark: str, count: int) -> List[Any]:
-    """Load tasks from HF datasets with the sealed seed."""
+def _sample_pool(benchmark: str, counts: Dict[str, int]) -> List[Any]:
+    """Sample the deterministic task pool per the frozen protocol (sealed seed)."""
     from trinity.orchestration.dataset import load_tasks
-    import random as _random
 
-    rng = _random.Random(_BENCHMARK_SEED)
-    tasks = load_tasks(benchmark, "train", max_items=count * 3, seed=_BENCHMARK_SEED)
-    rng.shuffle(tasks)
-    return tasks[:count]
+    return protocol.sample_pool(load_tasks, benchmark, counts, seed=_BENCHMARK_SEED)
 
 
 async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> None:
@@ -97,21 +99,21 @@ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> Non
                     item["model_answers"][model_name] = ""
 
 
-def _task_to_item(task: Any) -> Dict:
-    """Convert a trinity Task to a benchmark item dict."""
-    benchmark = getattr(task, "benchmark", "math500") or "math500"
-    b_lower = benchmark.lower().strip()
-    if b_lower in ("math500", "math", "aime", "aime2025"):
-        task_type = "math"
-    elif b_lower in ("mmlu", "gpqa", "gpqa-diamond", "gpqa_diamond"):
-        task_type = "knowledge"
-    else:
-        task_type = "code"
+def _task_to_item(task: Any, index: int) -> Dict:
+    """Convert a trinity Task to a benchmark item dict (shape unchanged).
 
+    ``index`` is the task's position in the sampled pool; it only feeds the
+    deterministic id fallback (``protocol.question_id``) for tasks without a
+    stable ``task_id``.
+    """
+    benchmark = getattr(task, "benchmark", "math500") or "math500"
+    prompt = getattr(task, "prompt", "")
     return {
-        "question_id": getattr(task, "task_id", f"q_{hash(task.prompt) % 100000}"),
-        "question_text": getattr(task, "prompt", ""),
-        "task_type": task_type,
+        "question_id": protocol.question_id(
+            benchmark, index, prompt, existing=getattr(task, "task_id", None)
+        ),
+        "question_text": prompt,
+        "task_type": protocol.task_type(benchmark),
         "benchmark": benchmark,
         "correct_answer": getattr(task, "answer", None),
         "model_answers": {},
@@ -131,31 +133,35 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
     print(f"  Output: {bench_dir}")
     print()
 
-    # Determine task counts based on benchmark type
-    eval_count = 150
-    audit_count = 50
-    live_count = 20
-    total_needed = eval_count + audit_count + live_count
+    # Per-split counts come from the frozen protocol (default 150/50/20).
+    counts = protocol.split_counts(benchmark)
+    total_needed = protocol.total_needed(counts)
 
-    # Load tasks
+    # Load the deterministic pool, then carve disjoint splits per the protocol.
     print(f"Loading {total_needed}+ tasks from {benchmark}...")
-    tasks = _load_tasks(benchmark, total_needed + 50)  # 50 extra margin
+    tasks = _sample_pool(benchmark, counts)
     print(f"  Loaded {len(tasks)} tasks")
+    task_splits = protocol.select_splits(tasks, counts)
 
-    # Split: first eval_size are eval, next audit_size are audit, next live_size are live
-    eval_tasks = tasks[:eval_count]
-    audit_tasks = tasks[eval_count:eval_count + audit_count]
-    live_tasks = tasks[eval_count + audit_count:eval_count + audit_count + live_count]
+    # Convert to items with a stable, protocol-defined id. A pool-global index
+    # feeds the deterministic id fallback so ids never collide across splits.
+    items_by_split: Dict[str, List[Dict]] = {}
+    idx = 0
+    for name in protocol.SPLIT_ORDER:
+        built = []
+        for t in task_splits[name]:
+            built.append(_task_to_item(t, idx))
+            idx += 1
+        items_by_split[name] = built
 
-    eval_items = [_task_to_item(t) for t in eval_tasks]
-    audit_items = [_task_to_item(t) for t in audit_tasks]
-    live_items_raw = [_task_to_item(t) for t in live_tasks]
+    eval_items = items_by_split["eval"]
+    audit_items = items_by_split["audit"]
 
-    # Live items don't need cached answers (they get live API calls)
-    # But we need to strip model_answers expectation
+    # Live items don't need cached answers (they get live API calls), so strip
+    # the model_answers field.
     live_items = [
         {k: v for k, v in item.items() if k != "model_answers"}
-        for item in live_items_raw
+        for item in items_by_split["live"]
     ]
 
     print(f"  Eval:  {len(eval_items)} questions")
@@ -197,26 +203,24 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
         password,
     ))
 
-    # Compute content hash (over the unencrypted data, for audit)
-    h = hashlib.sha256()
-    for item in sorted(eval_items + audit_items + live_items, key=lambda x: x["question_id"]):
-        h.update(item["question_text"].encode("utf-8"))
-    content_hash = h.hexdigest()
+    # Integrity hash over the unencrypted data, per the frozen protocol. Unlike a
+    # question-text-only digest, manifest_hash also pins each item's SPLIT, so a
+    # rebuild that reshuffles the same questions across eval/audit/live is caught.
+    splits = {"eval": eval_items, "audit": audit_items, "live": live_items}
+    content_hash = protocol.manifest_hash(splits)
 
     # Write unencrypted hash file (public — miners can verify benchmark hasn't changed)
     (bench_dir / "hash.txt").write_text(f"{content_hash}\n")
 
-    # Write metadata
-    meta = {
-        "benchmark": benchmark,
-        "seed": _BENCHMARK_SEED,
-        "eval_count": len(eval_items),
-        "audit_count": len(audit_items),
-        "live_count": len(live_items),
-        "content_hash": content_hash,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "pool_models": pool_models,
-    }
+    # Write the public, committable audit manifest (deterministic apart from the
+    # timestamp and pool list).
+    meta = protocol.build_manifest(
+        benchmark,
+        splits,
+        seed=_BENCHMARK_SEED,
+        pool_models=pool_models,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
     (bench_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
     print(f"\n  Benchmark hash: {content_hash}")
