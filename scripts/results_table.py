@@ -71,6 +71,9 @@ def render(rows: list[dict]) -> str:
         out.append("\n## Multi-task summary (the paper's R1/R2 claim)\n")
         # union of single models across benches
         models = sorted({m for r in rows for m in r["singles"]})
+        # Every system is reduced across a benchmark's eval rows the SAME way (per-bench best),
+        # then averaged over benchmarks. Reducing TRINITY with max while averaging the baselines
+        # would compare a cherry-picked best against a mean and bias R1/R2 toward TRINITY.
         # best per-bench single score for each model (max across that bench's evals)
         def single_avg(model):
             vals = []
@@ -78,13 +81,12 @@ def render(rows: list[dict]) -> str:
                 bench_vals = [r["singles"].get(model) for r in by_bench[b] if model in r["singles"]]
                 bench_vals = [v for v in bench_vals if v is not None]
                 if bench_vals:
-                    vals.append(sum(bench_vals) / len(bench_vals))
+                    vals.append(max(bench_vals))
             return sum(vals) / len(vals) if vals else None
         # TRINITY per-task best (max TRINITY across coordinators per bench), averaged
         trin_avg = sum(max(r["trinity"] for r in by_bench[b]) for b in benches) / len(benches)
-        rand_avg = sum(
-            sum(r["random"] for r in by_bench[b]) / len(by_bench[b]) for b in benches
-        ) / len(benches)
+        # Random routing: per-bench best too, so R4 also compares like with like.
+        rand_avg = sum(max(r["random"] for r in by_bench[b]) for b in benches) / len(benches)
         out.append(f"Averaged across {benches}:\n")
         out.append("| system | multi-task average |")
         out.append("|---|---|")

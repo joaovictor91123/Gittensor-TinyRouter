@@ -1,32 +1,31 @@
-"""Built-in adapters for the benchmarks the repo already ships.
+"""Generic delegating adapter + built-in registration.
 
-These wrap the existing, already-factored pipeline rather than duplicating it:
+The four shipped benchmarks (``math500``, ``mmlu``, ``gpqa``, ``livecodebench``)
+now each have a dedicated :class:`~trinity.adapters.base.BenchmarkAdapter`
+subclass in :mod:`trinity.adapters.benchmarks` (issue #10); this module keeps the
+generic :class:`DelegatingBenchmarkAdapter` — a name-parametrised wrapper still
+useful for ad-hoc registration and tests — and re-exports the built-in
+registration entry point.
 
-* task loading delegates to :func:`trinity.orchestration.dataset.load_tasks`;
-* scoring delegates to :func:`trinity.orchestration.reward.score_text`, the one
-  de-bugged extractor the evaluator, oracle-ceiling diagnostic, and Fugu reward
-  all already share;
-* the task-type family is derived from the same benchmark frozensets that
-  ``reward.py`` dispatches on, so the taxonomy cannot drift from the scorer.
+:class:`DelegatingBenchmarkAdapter` routes:
 
-Because every current benchmark ({math500, mmlu, gpqa, livecodebench}) is served
-by that shared pipeline, one parametrised :class:`DelegatingBenchmarkAdapter`
-covers them all; each is registered under its own name. When a benchmark grows
-logic that no longer fits the shared loader (the SWE-bench patch evaluator in
-#17/#18, the MMLU-Pro / LiveCodeBench-v6 adapters in #12/#13), it graduates to a
-dedicated :class:`~trinity.adapters.base.BenchmarkAdapter` subclass — the
-registry seam means that change touches only this module.
+* loading to :func:`trinity.adapters.loaders.load_split` (the same raw-or-toy +
+  deterministic shuffle/truncate path the concrete adapters use), so it takes no
+  dependency on the dataset module and cannot form an import cycle;
+* scoring to :func:`trinity.orchestration.reward.score_text`;
+* its task-type family to ``reward.py``'s own dispatch frozensets, so the
+  taxonomy cannot drift from the scorer.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from trinity.orchestration import reward as _reward
-from trinity.orchestration.dataset import load_tasks as _load_tasks
 from trinity.types import Task
 
+from . import loaders
 from .base import BenchmarkAdapter, TaskType
-from .registry import register_adapter
+from .benchmarks import register_builtin_adapters
 
 __all__ = ["DelegatingBenchmarkAdapter", "register_builtin_adapters"]
 
@@ -73,7 +72,7 @@ class DelegatingBenchmarkAdapter(BenchmarkAdapter):
         max_items: int | None,
         seed: int = 0,
     ) -> list[Task]:
-        return _load_tasks(self.name, split, max_items, seed=seed)
+        return loaders.load_split(self.name, split, max_items, seed=seed)
 
     def build_prompt(self, task: Task) -> str:
         return task.prompt
@@ -93,21 +92,3 @@ class DelegatingBenchmarkAdapter(BenchmarkAdapter):
             "task_type": self._task_type.value,
             "meta": dict(task.meta),
         }
-
-
-#: Benchmarks currently served by the shared pipeline. Mirrors
-#: ``dataset.SUPPORTED_BENCHMARKS``; kept explicit so registration is auditable.
-_BUILTIN_BENCHMARKS: tuple[str, ...] = ("math500", "mmlu", "gpqa", "livecodebench")
-
-
-def register_builtin_adapters() -> None:
-    """Register a delegating adapter for each built-in benchmark.
-
-    Idempotent-friendly: skips names already registered so re-import (or a test
-    that registered its own adapter for a built-in name) does not raise.
-    """
-    from .registry import is_registered
-
-    for name in _BUILTIN_BENCHMARKS:
-        if not is_registered(name):
-            register_adapter(name, DelegatingBenchmarkAdapter(name))

@@ -17,7 +17,14 @@ the interface and :mod:`trinity.adapters.registry` for the lookup.
 from __future__ import annotations
 
 from .base import BenchmarkAdapter, TaskType
-from .builtin import DelegatingBenchmarkAdapter, register_builtin_adapters
+from .benchmarks import (
+    GpqaAdapter,
+    LiveCodeBenchAdapter,
+    Math500Adapter,
+    MmluAdapter,
+    register_builtin_adapters,
+)
+from .builtin import DelegatingBenchmarkAdapter
 from .registry import (
     available_adapters,
     clear_registry,
@@ -30,6 +37,10 @@ __all__ = [
     "BenchmarkAdapter",
     "TaskType",
     "DelegatingBenchmarkAdapter",
+    "Math500Adapter",
+    "MmluAdapter",
+    "GpqaAdapter",
+    "LiveCodeBenchAdapter",
     "register_adapter",
     "get_adapter",
     "is_registered",
