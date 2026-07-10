@@ -63,7 +63,14 @@ __all__ = [
 # Benchmark routing tables. Keys are matched case-insensitively against
 # ``Task.benchmark`` (which the dataset loaders set, e.g. "math500").
 MATH_BENCHMARKS: frozenset[str] = frozenset({"math500", "math", "aime", "aime2025"})
-CHOICE_BENCHMARKS: frozenset[str] = frozenset({"mmlu", "gpqa", "gpqa-diamond", "gpqa_diamond"})
+CHOICE_BENCHMARKS: frozenset[str] = frozenset(
+    {"mmlu", "mmlu_pro", "mmlu-pro", "gpqa", "gpqa-diamond", "gpqa_diamond"}
+)
+
+# Multiple-choice option letters, in order. MMLU/GPQA use A-D; MMLU-Pro uses up
+# to A-J (issue #12). The choice extractor and reference normaliser both range
+# over this, so widening it here widens both consistently.
+_CHOICE_LETTERS: str = "ABCDEFGHIJ"
 CODE_BENCHMARKS: frozenset[str] = frozenset(
     {"livecodebench", "lcb", "bigcodebench", "bigcode"}
 )
@@ -441,11 +448,11 @@ def _ref_to_str(reference: object) -> str:
 _CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Require the captured letter to be followed by a delimiter or end-of-word,
     # so "the answer Beats..." does NOT match "B" (P2 review fix).
-    re.compile(r"answer\s*(?:is|:)?\s*\(?\s*([A-D])\s*(?:[\).:]|\b)(?![A-Za-z])", re.I),
-    re.compile(r"\\boxed\s*\{\s*\(?\s*([A-D])\s*\)?\s*\}", re.I),
-    re.compile(r"\bfinal\s+answer\s*[:=]?\s*\(?\s*([A-D])(?![A-Za-z])", re.I),
-    re.compile(r"\boption\s*\(?\s*([A-D])(?![A-Za-z])", re.I),
-    re.compile(r"^\s*\(?\s*([A-D])\s*[\).:]", re.M),
+    re.compile(r"answer\s*(?:is|:)?\s*\(?\s*([A-J])\s*(?:[\).:]|\b)(?![A-Za-z])", re.I),
+    re.compile(r"\\boxed\s*\{\s*\(?\s*([A-J])\s*\)?\s*\}", re.I),
+    re.compile(r"\bfinal\s+answer\s*[:=]?\s*\(?\s*([A-J])(?![A-Za-z])", re.I),
+    re.compile(r"\boption\s*\(?\s*([A-J])(?![A-Za-z])", re.I),
+    re.compile(r"^\s*\(?\s*([A-J])\s*[\).:]", re.M),
 )
 
 
@@ -480,7 +487,7 @@ def extract_choice_letter(text: str) -> str | None:
     # it is essentially just the letter (e.g. "B", "(C)", "D."). This avoids the
     # English article "A" in prose like "A nice approach" being read as a choice.
     for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
-        m = re.fullmatch(r"\(?\s*([A-D])\s*\)?[.:]?", line, re.I)
+        m = re.fullmatch(r"\(?\s*([A-J])\s*\)?[.:]?", line, re.I)
         if m:
             return m.group(1).upper()
         break  # only inspect the final non-empty line
@@ -512,12 +519,12 @@ def _normalize_reference_letter(reference: object) -> str | None:
         if letter is not None:
             return letter
         s = reference.strip().upper()
-        return s if s in {"A", "B", "C", "D"} else None
+        return s if s in set(_CHOICE_LETTERS) else None
     if isinstance(reference, bool):
         return None
     if isinstance(reference, int):
-        if 0 <= reference <= 3:
-            return "ABCD"[reference]
+        if 0 <= reference < len(_CHOICE_LETTERS):
+            return _CHOICE_LETTERS[reference]
         return None
     return None
 

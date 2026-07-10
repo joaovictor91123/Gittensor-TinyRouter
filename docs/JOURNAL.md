@@ -32,32 +32,32 @@ after : [warn] trinity: 1/4 tasks failed after retries; scored 0.0   -> score 0.
 
 ---
 
-## 2026-07-09 — Hosted pool switched from Fireworks to OpenRouter-only  #decision #finding
-**Context:** the repo had drifted: current roadmap/competition planning had already moved to the `qwen3.5-35b-a3b` / `minimax-m3` / `deepseek-v4-flash` pool, but the runnable code, scripts, and environment contract still assumed Fireworks plus `FIREWORKS_API_KEY`.
-**Expected:** one hosted-provider path, one API key contract, one default model pool, and pricing/config docs that all agree.
-**Actual:** migrated the live client/config path to OpenRouter-only, added `trinity.llm.openrouter_client`, switched the default pool in `configs/models.yaml`, updated remote scripts to require `OPENROUTER_API_KEY`, updated active train/eval/smoke entrypoints, and refreshed default pricing tables to the OpenRouter list prices for the new pool.
-**Root cause:** repository planning evolved faster than the implementation layer, leaving a split-brain state between docs and executable code.
-**Fix / decision:** OpenRouter is now the only supported hosted-model provider in the live path. A small `fireworks_client.py` import shim remains only for backward compatibility with stale local scripts, but it aliases the OpenRouter client and no longer introduces a second provider contract.
-**Follow-up:** historical notes/results that explicitly describe prior Fireworks runs are preserved as historical records; only the live operational path was migrated.
+## 2026-07-09 — Rate-limit gate parsed UTC timestamps as local time  #mistake #finding #decision
 
-## 2026-07-09 — Roadmap realigned to the SN74 three-benchmark competition plan  #decision
-**Context:** after reframing the README around the SN74 competition loop, `ROADMAP.md` was still describing the old math500/MMLU competition shape and did not reflect the new target benchmarks or the staged TRINITY-then-Conductor plan.
-**Expected:** the roadmap should describe the current competition objective, frozen-protocol requirements, benchmark-adapter work, oracle-headroom gate, shared-head training path, miner PR flow, and the later benchmark/model-pool expansion path.
-**Actual:** rewrote `ROADMAP.md` around the current 3-benchmark target (`SWE-bench Verified`, `LiveCodeBench v6`, `MMLU-Pro`), the current 3-model pool, Phase 0 protocol freeze, Phase 1 adapters, Phase 2 oracle analysis, Phase 3 shared TRINITY head on RTX 5090, Phase 4 miner competition loop, and Phase 5 Conductor on H100.
-**Root cause:** the old roadmap had become historically stale: it still reflected the earlier math500/MMLU competition framing rather than the intended SN74-style multi-benchmark competition.
-**Fix / decision:** align the roadmap with the new README and use it as the canonical phase plan for the competition front door. Keep detailed implementation decisions in `AGENTS.md` and `docs/SPEC.md`.
-**Follow-up:** once the protocol file, benchmark manifests, and submission artifact contract exist, link them from the roadmap so the phases point to concrete deliverables rather than just headings.
+**Context:** Auditing the anti-cheat gates in `scripts/pr_eval.py`. Gate 1
+(`_check_rate_limit`) enforces "1 submission per benchmark per week" by comparing
+each leaderboard `history` entry's `timestamp` against a 7-day cutoff.
+**Expected:** the 7-day window behaves identically wherever `pr_eval.py` runs.
+**Actual:** timestamps are *written* in UTC (`time.strftime("...Z", time.gmtime())`
+in `_update_leaderboard`) but were *read back* with
+`time.mktime(time.strptime(ts, "...Z"))`. `time.mktime` interprets the struct as
+**local** time, so on a non-UTC host the parsed epoch is skewed by the host's UTC
+offset. Repro on a UTC+9 box: `2026-01-01T00:00:00Z` parsed to an epoch **9 h
+earlier** than the true instant. Near the window boundary this lets a miner east
+of UTC evade the rate limit (their prior submission reads as older than it is).
+**Root cause:** `time.mktime` is the inverse of `time.localtime`, not
+`time.gmtime`. The correct UTC inverse is `calendar.timegm`.
+**Fix / decision:** added `_parse_utc_timestamp()` (uses `calendar.timegm`, returns
+`None` on empty/malformed input) and routed the gate through it, so the window is
+timezone-independent. Covered by `tests/test_pr_eval_rate_limit.py` (asserts the
+true UTC epoch via `datetime(..., tzinfo=utc)`, and — where `time.tzset` exists —
+re-checks under forced non-UTC zones).
+**Follow-up:** none for this bug. Separately noted while reading the gate: only
+*approved* submissions are appended to `history`, so the rate limit currently
+counts prior *wins*, not prior *attempts* — a larger design question left for its
+own change.
 
 ---
-
-## 2026-07-09 — README reframed to SN74 competition front door  #decision
-**Context:** the repo front page had drifted between an internal TRINITY replication lab notebook and a public-facing competition pitch. We needed a README that matched the intended Gittensor SN74-style miner competition framing while preserving the TRINITY-then-Conductor roadmap.
-**Expected:** a README aligned to subnet competition style would describe the frozen composite benchmark, miner PR flow, verified frontier scoring, current 3-benchmark scope, and staged hardware plan without pretending the repo already implements the full ultimate roadmap.
-**Actual:** rewrote `README.md` around the SN74 competition loop: current benchmark triad (`SWE-bench Verified`, `LiveCodeBench v6`, `MMLU-Pro`), current 3-model pool, proposed eval labels, frozen protocol, miner guide, phased roadmap, and the TRINITY-on-5090 then Conductor-on-H100 plan.
-**Root cause:** the earlier README mixed replication results, competition claims, and aspirational scope in a way that was no longer a clean front door for contributors.
-**Fix / decision:** make the README explicitly competition-first and benchmark-protocol-first, while leaving `AGENTS.md` and `docs/SPEC.md` as the implementation/research source of truth. The README now explains the current competition scope and the long-term expansion path separately.
-**Follow-up:** if the evaluator, packaging flow, or hidden benchmark protocol solidifies further, the README should be tightened again so the submission artifacts and score labels match the actual code rather than the planned interface.
-
 
 ## 2026-06-25 — Constrained decoding fixes parse_rate (1.0), but GRPO has a dead gradient (samples=0)  #repro #finding #decision #gotcha
 
