@@ -28,6 +28,7 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
 **Follow-up:** `scripts/audit_eval.py` builds its own `single::` baselines and needs the same treatment; `pr_eval.py`'s cached single-turn component is a separate contract (it caches one WORKER turn per question) and is deliberately not changed here.
 
 ---
+
 ## 2026-07-10 — Verifier verdicts missed when the model wraps them in Markdown  #mistake #finding #decision
 
 **Context:** `roles/verifier.py::parse_verdict` extracts `VERDICT: ACCEPT|REVISE`
