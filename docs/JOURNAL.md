@@ -18,6 +18,20 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
 
 ---
 
+## 2026-07-10 — One timed-out trajectory discarded an entire eval  #mistake #gotcha
+**Context:** the 2026-06-22 entry records that an uncaught exception propagating through `asyncio.gather` killed a whole training run, and that `evaluate_candidate` was fixed to use `gather(return_exceptions=True)` so a retry-exhausted trajectory degrades to reward 0. Checking whether the evaluator got the same treatment.
+**Expected:** `eval.py` would already be resilient, since it runs the same `run_trajectory` over ~100 tasks x N reps — strictly more exposure to transient network errors than a training minibatch.
+**Actual:** it was not. Both `_score_policy` and `_score_single_model` called bare `asyncio.gather`, so a single `httpx.ReadTimeout` that exhausted its retries re-raised out of `evaluate()` and destroyed the run — including every single-model baseline already computed. Reproduced with a fake pool where 1 of 4 tasks raises:
+```
+before: entire eval ABORTED -> RuntimeError: retries exhausted
+after : [warn] trinity: 1/4 tasks failed after retries; scored 0.0   -> score 0.75
+```
+**Root cause:** the `return_exceptions=True` fix was applied to the training path (`optim/fitness.py`) but never propagated to the evaluation path, which is the *more* exposed of the two. The two files were fixed at different times by different work.
+**Fix / decision:** gather with `return_exceptions=True` in both eval scorers and route the outcomes through one shared `_mean_scoring_failures_as_zero` helper. A failed trajectory produced no answer, so it scores 0.0 and **stays in the denominator** — the same pessimistic convention training already uses; silently dropping it would inflate the score by survivorship. Failures are printed with a count so a degraded number is never mistaken for a clean one. Guard added: if *every* task fails, raise instead of reporting 0.0 — a dead API must not be reportable as a measurement of zero accuracy.
+**Follow-up:** the failure count is printed but not written into the `results` dict, because `results_table.py` and `audit_eval.py` both key off `single::`/`single_std::` prefixes and would need a schema change. Threading an explicit `n_failed` through the results JSON is worth doing when that schema is next touched.
+
+---
+
 ## 2026-07-09 — Hosted pool switched from Fireworks to OpenRouter-only  #decision #finding
 **Context:** the repo had drifted: current roadmap/competition planning had already moved to the `qwen3.5-35b-a3b` / `minimax-m3` / `deepseek-v4-flash` pool, but the runnable code, scripts, and environment contract still assumed Fireworks plus `FIREWORKS_API_KEY`.
 **Expected:** one hosted-provider path, one API key contract, one default model pool, and pricing/config docs that all agree.

@@ -18,6 +18,7 @@ import json
 import random
 from pathlib import Path
 from statistics import mean
+from typing import Callable
 
 import numpy as np
 import yaml
@@ -89,12 +90,58 @@ def task_rng(seed: int, task_id: str) -> random.Random:
     return random.Random(f"{seed}:{task_id}")
 
 
+def _mean_scoring_failures_as_zero(
+    outcomes: list, score: Callable[[object], float], label: str
+) -> float:
+    """Average ``score`` over ``outcomes``, counting exhausted-retry failures as 0.0.
+
+    ``outcomes`` is the result of ``asyncio.gather(..., return_exceptions=True)``,
+    so a task that exhausted its retries appears as a ``BaseException`` rather than
+    aborting the whole evaluation. Such a task produced no answer, so it scores 0.0
+    -- the same (slightly pessimistic) convention ``optim.fitness`` already applies
+    on the training side.
+
+    Args:
+        outcomes: Per-task results, each either a value or a ``BaseException``.
+        score: Maps a successful outcome to its scalar score.
+        label: Condition name, used in the diagnostic printed on failures.
+
+    Returns:
+        The mean score over all tasks.
+
+    Raises:
+        RuntimeError: If ``outcomes`` is empty, or if *every* task failed -- a mean
+            of 0.0 would then be an artifact of a dead API, not a measurement.
+    """
+    if not outcomes:
+        raise RuntimeError(f"{label}: no tasks to score")
+
+    n_failed = sum(1 for o in outcomes if isinstance(o, BaseException))
+    if n_failed == len(outcomes):
+        first = next(o for o in outcomes if isinstance(o, BaseException))
+        raise RuntimeError(
+            f"{label}: all {n_failed} tasks failed after retries; refusing to report "
+            f"0.0 as a score. First error: {first!r}"
+        )
+    if n_failed:
+        print(
+            f"  [warn] {label}: {n_failed}/{len(outcomes)} tasks failed after "
+            f"retries; scored 0.0"
+        )
+
+    scores = [0.0 if isinstance(o, BaseException) else float(score(o)) for o in outcomes]
+    return float(mean(scores))
+
+
 async def _score_policy(
     tasks, policy, pool, pool_models, *, adapter, sample, rng_seed: int | None = None, **run_kwargs
 ) -> float:
     import httpx
 
     async with httpx.AsyncClient() as cli:
+        # return_exceptions=True so one trajectory that exhausts retries (e.g. a
+        # persistent timeout) degrades to score 0 instead of discarding the whole
+        # evaluation -- including the baselines already computed.
         trajs = await asyncio.gather(
             *[
                 run_trajectory(
@@ -103,11 +150,12 @@ async def _score_policy(
                     **run_kwargs,
                 )
                 for t in tasks
-            ]
+            ],
+            return_exceptions=True,
         )
     # Score through the adapter (not reward.score directly) so the routed path
     # honours the same benchmark contract as the single-model baseline.
-    return float(mean(adapter.score_trajectory(t) for t in trajs))
+    return _mean_scoring_failures_as_zero(trajs, adapter.score_trajectory, "trinity")
 
 
 async def _score_single_model(tasks, pool, model, adapter, *, max_tokens, reasoning) -> float:
@@ -123,8 +171,8 @@ async def _score_single_model(tasks, pool, model, adapter, *, max_tokens, reason
                                   reasoning=reasoning, client=cli)
             return adapter.score_output(res.text, task.answer)
 
-        scores = await asyncio.gather(*[one(t) for t in tasks])
-    return float(mean(scores))
+        scores = await asyncio.gather(*[one(t) for t in tasks], return_exceptions=True)
+    return _mean_scoring_failures_as_zero(scores, float, f"single::{model}")
 
 
 async def evaluate(args) -> dict:
