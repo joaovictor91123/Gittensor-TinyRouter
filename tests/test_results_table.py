@@ -75,6 +75,26 @@ def test_random_routing_also_reduces_per_benchmark_best():
     assert "**R4** (TRINITY avg > random avg): ❌ (0.650 vs 0.700)" in summary
 
 
+def test_summary_tolerates_a_null_system_score():
+    """A partial/older eval*.json may carry a null TRINITY or lack random_routing.
+
+    `load_rows` only guarantees the keys exist, not that the values are non-null, so
+    `max(...)`/`sum(...)` over a `None` used to crash the multi-task summary. The
+    per-bench reduction now skips `None` (treating an all-null benchmark as 0.0).
+    """
+    rows = [
+        _row("math500", "coordA", trinity=0.60, single=0.50, random_=0.20),
+        _row("mmlu", "coordA", trinity=0.70, single=0.55, random_=0.30),
+    ]
+    rows[1]["trinity"] = None      # mmlu TRINITY missing
+    rows[1]["random"] = None       # mmlu random_routing missing
+
+    summary = _summary(rows)       # must not raise
+    # TRINITY: (0.60 + 0.0) / 2 = 0.300 ; random: (0.20 + 0.0) / 2 = 0.100
+    assert "**TRINITY (per-task best coordinator)** | **0.300**" in summary
+    assert "| random routing | 0.100 |" in summary
+
+
 def test_single_eval_row_per_benchmark_is_unchanged():
     """With one row per benchmark max == mean, so the summary is untouched by this fix."""
     rows = [

@@ -28,6 +28,48 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
 **Follow-up:** `scripts/audit_eval.py` builds its own `single::` baselines and needs the same treatment; `pr_eval.py`'s cached single-turn component is a separate contract (it caches one WORKER turn per question) and is deliberately not changed here.
 
 ---
+## 2026-07-10 — Verifier verdicts missed when the model wraps them in Markdown  #mistake #finding #decision
+
+**Context:** `roles/verifier.py::parse_verdict` extracts `VERDICT: ACCEPT|REVISE`
+from the Verifier turn; an ACCEPT terminates the trajectory early (SPEC §0.3.5).
+The regex was recently anchored with a trailing `\b` (good — stops `ACCEPTABLE`).
+**Expected:** a verdict still parses when the model emphasises it.
+**Actual:** it did not. Models routinely format the line as `**VERDICT:** ACCEPT`,
+`VERDICT: **ACCEPT**`, or ``VERDICT: `REVISE` ``, and `VERDICT:\s*(ACCEPT|REVISE)`
+requires the colon then only whitespace before the word — so all three returned
+`None`, the loop fail-safed to REVISE, and a correct+complete answer never earned
+the early ACCEPT. That needlessly runs the full turn budget, hurting the
+efficiency term (10% of the competition score) and raising live-eval latency/cost.
+**Root cause:** the separator between `VERDICT` and the verdict word only allowed
+whitespace, not Markdown emphasis / code / dash markers.
+**Fix / decision:** broaden the separator to `[\s:*_`~-]*` and replace the trailing
+`\b` with `(?![A-Za-z])`. The lookahead is needed because `\b` treats an underscore
+as a word char and would reject the italic wrapper `__REVISE__`; the lookahead
+blocks only a trailing *letter*, so the `ACCEPTABLE`/`ACCEPTED`/`REVISED` guard is
+preserved while `**`/`__`/`` ` ``/punctuation are fine. The character class matches
+no letters, so prose ("the verdict is … accept") is still rejected. Covered by new
+cases in `tests/test_verifier.py`.
+**Follow-up:** none.
+
+## 2026-07-10 — results_table multi-task summary crashed on a null system score  #mistake #gotcha
+
+**Context:** `scripts/results_table.py` aggregates `experiments/**/eval*.json` into
+the R1/R2/R4 summary. `load_rows` keeps a row when the `TRINITY` and `single::` keys
+are PRESENT.
+**Expected:** the summary renders for any row set `load_rows` accepts.
+**Actual:** `trin_avg = sum(max(r["trinity"] for r in by_bench[b]) ...)` (and the
+`random` twin) raise `TypeError: ... 'float' and 'NoneType'` when a row has
+`"TRINITY": null` (or lacks `random_routing`) — key present but value `None`. Key
+*presence* was checked; value *nullness* was not, so an older/partially-written
+eval file crashes the whole summary.
+**Root cause:** the per-benchmark reduction assumed every value non-null, unlike the
+per-row table which already guards with `x or 0`.
+**Fix / decision:** add `_bench_best(rows, key)` that maxes over non-null values
+(0.0 if a benchmark has none), and route both `trin_avg`/`rand_avg` through it —
+mirroring the per-row leniency. Covered by a null-score case in
+`tests/test_results_table.py`; the existing reduce-the-same-way tests are unchanged.
+**Follow-up:** none.
+
 ## 2026-07-10 — GPQA logical `test` resolved via a deterministic holdout  #finding #decision
 
 **Context:** closing the follow-up left by the MMLU split fix below — "GPQA still has only an
@@ -51,75 +93,6 @@ partition (a 2-item set cannot be divided) and still raises `ToyFallbackWarning`
 still reports toy-set numbers as if real. Promoting that warning to an error under `--strict-data`
 would close the class rather than this one instance. GPQA is also a gated HF repo — without auth
 the fallback still fires, now loudly but not fatally.
-
-## 2026-07-10 — Every submission receipt claimed `seed: 0`  #mistake #decision
-
-**Context:** closing the loose end from the `SepCMAES` seed fix (#38) — "a 'plausible CMA-ES
-fitness curve' is only re-derivable now that the default seed is honoured" (issue #109).
-**Expected:** `trinity.train --seed 7` then `pack_submission.py` yields `receipt.json` with
-`"seed": 7`.
-**Actual:** `"seed": 0`, for every run at every seed.
-**Root cause:** `pack_submission.build_receipt` read `summary.get("seed", 0)`, but `train.py`
-never wrote a `seed` key — its summary carried only `{benchmark, pool, n_total, popsize, m_cma,
-generations, best_fitness, run_dir}`. The `.get` default did all the work, silently.
-**Fix / decision:** `train.py` now records `"seed"` via a new pure `build_summary()` helper (the
-async `train()` needs a GPU pool, so the artifact schema had no offline test seam; the helper
-gives it one). `build_receipt` resolves the seed through `_resolve_seed()`, which records
-`null` — not `0` — when the key is absent. `[OUR CHOICE]` `0` is the wrong sentinel for "not
-recorded": it is indistinguishable from an honest `--seed 0` run, and per #38 pycma historically
-read seed `0` as *seed from the wall clock*. A packer that cannot name the seed should say so.
-`SUBMITTING.md` already advertised `receipt.json` as carrying the seed, so this restores a
-documented contract rather than inventing one.
-**Follow-up:** `pr_eval._validate_receipt` still does not *use* `receipt["seed"]`. Now that the
-field is trustworthy, Gate 4 could re-derive a claimed fitness curve from the seed instead of
-only checking its shape (monotonicity, start value, generation count). That would turn a
-plausibility heuristic into an actual reproduction check.
-
-## 2026-07-10 — Cost-ledger append reset to genesis after any chain break  #mistake #decision
-**Context:** follow-up audit of the unified cost-ledger module from #87/#88.
-Concurrent OpenRouter chats (`max_concurrency` default 8) append to the same
-JSONL with no lock; a tip race can leave one sibling line whose hash does not
-link.
-**Expected:** after a break, later appends still link to the **last line's**
-`h` (pre-#88 writer behaviour), so the tip keeps advancing and only the broken
-prefix fails verification.
-**Actual:** `append_ledger_entry` continued only when `verify_ledger_chain_text`
-returned valid. On any failure it set `prev_hash=""`, so every later write was
-a new genesis. `cost_report.py --ledger` kept failing; `pack_submission.py`
-silently reported `$0` once `valid` was false. The in-memory `file_handle=`
-hook also always read tip from disk (or `""`), so multi-append via `StringIO`
-could not build a chain either.
-**Root cause:** the #87/#88 unification correctly shared payload encoding, but
-the continue policy was tightened to "link only if whole file verifies" —
-stricter than the old writer and permanently worse under concurrency.
-**Fix / decision:** always take `prev_hash` from the last non-empty line
-(`tip_hash_from_text`); derive tip from the handle when `file_handle` is set;
-wrap disk read-tip+append in a sidecar exclusive lock so concurrent writers
-share one tip. Verification stays strict for reporting. Covered by
-`tests/test_cost_ledger.py` (broken-prefix append + `StringIO` chain).
-**Follow-up:** none for the genesis-reset hole. A broken prefix still fails
-full-chain verify (by design); operators can truncate to the last good prefix
-if they need a clean receipt.
-
-## 2026-07-10 — pack_submission priced ledger with flat blended rate, not in/out split  #mistake #finding #decision
-**Context:** wiring training receipts (`scripts/pack_submission.py`) to the verified
-cost ledger after #87 landed `trinity.llm.cost_ledger`.
-**Expected:** `receipt.json` → `total_cost_usd` matches
-`scripts/cost_report.py --ledger` on the same file (per-model prompt vs
-completion rates).
-**Actual:** pack used a hard-coded ``0.90 * (p + c) / 1M`` for every model.
-Example — 1M prompt tokens on qwen3.5-35b-a3b: cost_report charges **$0.14**;
-pack wrote **$0.90** into the receipt. Gate 4 (`pr_eval.py`) cross-checks
-``total_cost_usd`` against a plausible training spend, so receipts disagreed
-with maintainer tooling and could false-pass or false-fail the minimum-cost gate.
-**Root cause:** ledger verification was centralized in #87, but dollar pricing
-still lived only in `cost_report.py` while pack kept a stale blended shortcut.
-**Fix / decision:** add `trinity.llm.openrouter_pricing` as the single rate table
-+ `token_cost` / `verified_ledger_total_usd` helpers; route both
-`cost_report.py` and `pack_submission.py` through it. Covered by
-`tests/test_openrouter_pricing.py`.
-**Follow-up:** `trinity.fugu.cost.PRICES` and oracle-ceiling defaults remain a
-separate table — dedupe is tracked in the open refactor PR #8.
 
 ## 2026-07-10 — Cost-ledger verifier hashed a different JSON string than the writer  #mistake #decision
 **Context:** checking the token-cost ledger path used by training, `cost_report.py`,

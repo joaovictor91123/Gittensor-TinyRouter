@@ -58,6 +58,37 @@ def test_prefix_word_does_not_shadow_a_later_real_verdict():
 
 
 # ---------------------------------------------------------------------------
+# Markdown / separator formatting around the verdict still parses
+# ---------------------------------------------------------------------------
+def test_markdown_formatted_verdicts_parse():
+    # Models routinely emphasise the verdict line. A strict ``VERDICT:\s*`` missed
+    # all of these, so the loop fail-safed to REVISE and never accepted early.
+    assert parse_verdict("**VERDICT: ACCEPT**") == "ACCEPT"
+    assert parse_verdict("**VERDICT:** ACCEPT") == "ACCEPT"
+    assert parse_verdict("VERDICT: **ACCEPT**") == "ACCEPT"
+    assert parse_verdict("VERDICT: __REVISE__") == "REVISE"
+    assert parse_verdict("VERDICT: `REVISE`") == "REVISE"
+    assert parse_verdict("#### VERDICT: ACCEPT") == "ACCEPT"
+    assert parse_verdict("VERDICT - ACCEPT") == "ACCEPT"
+
+
+def test_markdown_does_not_defeat_the_prefix_word_guard():
+    # The word-boundary guard must survive the broadened separators.
+    assert parse_verdict("VERDICT: **ACCEPTABLE** only if fixed") is None
+    assert parse_verdict("VERDICT: `REVISED` the plan") is None
+
+
+def test_markdown_last_verdict_still_wins():
+    text = "First **VERDICT: REVISE**.\nThen, on reflection, VERDICT: **ACCEPT**"
+    assert parse_verdict(text) == "ACCEPT"
+
+
+def test_diagnosis_strips_a_markdown_verdict_line():
+    text = "The bound is loose.\nVERDICT: **ACCEPT**"
+    assert extract_diagnosis(text) == "The bound is loose."
+
+
+# ---------------------------------------------------------------------------
 # Diagnosis must not be truncated at a false match
 # ---------------------------------------------------------------------------
 def test_diagnosis_is_everything_above_the_final_verdict():
